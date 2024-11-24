@@ -1,0 +1,28 @@
+import pprint
+import polars as pl
+from sklearn.svm import SVC
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import recall_score
+from sklearn.metrics import f1_score
+from sklearn.metrics import precision_score
+import xgboost as xgb
+
+user_cards_path = r"E:\credit card\user_card.csv"
+df = pl.read_csv(user_cards_path)
+y = df["target_Encoded"]
+x = df.drop("target_Encoded")
+
+X_train, X_test, y_train, y_test = train_test_split(x, y, test_size=.20, random_state=42)
+
+model = LinearSVC(class_weight="balanced")
+
+print("Training begin")
+
+model.fit(X_train, y_train)
+y_pred = model.predict(X_test)
+
+recall = recall_score(y_test, y_pred)
+print(f"recall: {recall:.2f}")
+
