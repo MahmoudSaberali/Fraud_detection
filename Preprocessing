@@ -1,0 +1,161 @@
+import gc
+
+import numpy as np
+import json
+import pprint
+import subprocess
+import numpy as np
+import polars as pl
+from sklearn.feature_extraction.text import FeatureHasher
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.preprocessing import OrdinalEncoder
+
+pl.Config.set_tbl_cols(-1)  # codes for how DF table show in console
+pl.Config.set_tbl_rows(-1)
+
+labels_json = r"E:\credit card\train_fraud_labels.json"
+with open(labels_json, "r") as labels_json_:
+    labels_ = json.load(labels_json_)
+
+list_of_ids = []
+list_of_labels = []
+
+for key, nested_duct in labels_.items():  # Json file that have the label that tells us what transaction is fraud or not
+    # stored in Json and its structure is dict have only one key but have value of dict and inside of this dict have
+    # another dicts ,so we have to extraxt the data form the main key by the below code.
+    for key_ in nested_duct.keys():  # extract data from the nested dict
+        list_of_labels.append(key_)
+    for id_ in nested_duct.values():
+        list_of_ids.append(id_)
+
+
+list_of_data_paths = [r"E:\credit card\cards_data.csv", r"E:\credit card\transactions_data.csv",
+                      r"E:\credit card\users_data.csv"]
+card_path = r"E:\credit card\cards_data.csv"
+
+#cards_data = pl.read_csv(list_of_data_paths[0])
+users_data = pl.read_csv(list_of_data_paths[2])
+#transaction_data = pl.scan_csv(list_of_data_paths[1])
+card_df = pl.read_csv(card_path,columns=['id', 'client_id', 'card_brand', 'card_type', 'credit_limit'])
+
+
+def split_data_to_parts(data_path: str):  # data was to big so tried to split them into 3 parts
+    list_of_stats = [0, 4435305, 8870610]
+    list_of_endings = [4435305, 8870610, 13305915]
+    for start, ending, part_name in zip(list_of_stats, list_of_endings, range(len(list_of_endings))):
+        transaction_data = pl.read_csv(data_path)[start:ending]
+        transaction_data.with_columns(pl.col("errors").fill_null("No error")).write_csv(
+            rf"E:\credit card\part{part_name}.csv")
+    print("Data successfully split and saved!")
+
+
+def clean_data(data: pl.DataFrame, col_name: str, *signs: str) -> pl.DataFrame:  # Function for automated cleaning
+    expr = pl.col(col_name)
+
+    # Apply replace_all for each sign
+    for sign in signs:
+        expr = expr.str.replace_all(rf'\{sign}', '')
+
+    # Final transformations
+    data = data.with_columns(
+        expr.str.strip_chars()
+        .cast(pl.Float64)
+    )
+    return data
+
+
+transaction_DS = pl.read_csv("E:\credit card\part0.csv")  # read a part of the dataset
+full_data = transaction_DS.join(users_data, left_on="client_id", right_on="id")  # Join dataset
+full_data = full_data.drop(["current_age", 'birth_year', 'birth_month', 'latitude', 'longitude', 'date', 'mcc',
+                            'client_id',"address"])   # drop few columns
+full_data = full_data.with_columns(pl.col("zip").fill_null("0"))  # fill Null
+full_data = full_data.with_columns(pl.col("merchant_state").fill_null("Online"))
+
+
+label_df = pl.DataFrame({"target": list_of_ids, "id": list_of_labels})
+full_data = full_data.with_columns(pl.col("id").cast(str))
+full_data = full_data.join(label_df, on="id")
+user_card = card_df.join(full_data, left_on="id", right_on="card_id").drop("id_right")
+print("full DS", user_card.columns)
+#full_data.write_csv(r"E:\credit card\transactional_data.csv")  # save file to add in Tableau
+
+
+# Iterate over all columns and their data types
+for col_name, data_type in zip(user_card.columns, user_card.dtypes):
+    if data_type == pl.String:
+        try:
+            # Clean the column values and replace the column in the DataFrame
+            user_card = user_card.with_columns(
+                clean_data(user_card, col_name, "$", ",")
+            )
+        except Exception as e:
+            print(f"Skipping column '{col_name}' due to an error: {e}")
+
+for col, dtype in zip(user_card.columns, user_card.dtypes):  # info about how many unique value DS have
+    if dtype == pl.Utf8:
+        if col != "id":
+            print(col, user_card[col].n_unique())
+            print("-"*25)
+
+
+# Decode
+def apply_feature_hashing(df: pl.DataFrame, column_name: str, n_features: int = 100) -> pl.DataFrame:
+
+    # Initialize HashingVectorizer
+    hasher = HashingVectorizer(n_features=n_features, alternate_sign=False)
+
+    # Convert column to list of strings for HashingVectorizer
+    text_data = df[column_name].to_list()
+
+    # Transform the column
+    hashed_features = hasher.transform(map(str, text_data))
+
+    # Convert sparse matrix to dense array
+    hashed_array = hashed_features.toarray()
+
+    # Create new column names for the hashed features
+    hash_column_names = [f'{column_name}_hash_{i}' for i in range(n_features)]
+
+    # Create a new Polars DataFrame with the hashed features
+    hashed_df = pl.DataFrame(
+        hashed_array,
+        schema={name: pl.Float32 for name in hash_column_names}
+    )
+
+    # Combine original DataFrame with hashed features
+    result_df = df.hstack(hashed_df)
+
+    return result_df.drop(column_name)
+
+
+def appley_ordinal(df: pl.DataFrame, col_name):
+    ordinal_encoder = OrdinalEncoder()
+    text_data = df[col_name].to_list()
+    text_data_2d = [[item] for item in text_data]
+    encode_data = ordinal_encoder.fit_transform(text_data_2d)
+    new_df = pl.DataFrame({col_name+"_Encoded": encode_data.flatten()})
+    joined_df = df.hstack(new_df)
+    return joined_df.drop(col_name)
+
+
+# Assuming apply_feature_hashing and apply_ordinal are already defined
+
+def process_user_card(user_card: pl.DataFrame, output_path: str):
+    # Clone the input DataFrame to preserve the original
+    processed_df = user_card.clone()
+
+    for col, dtype in zip(user_card.columns, user_card.dtypes):
+        if dtype == pl.Utf8:  # Process string columns
+            if col != "id" and user_card[col].n_unique() < 100:
+                # Apply ordinal encoding
+                processed_df = appley_ordinal(processed_df, col)
+            else:
+                # Apply feature hashing
+                processed_df = apply_feature_hashing(processed_df, col, n_features=100)
+
+    # Save the final transformed DataFrame
+    processed_df.write_csv(output_path)
+
+
+output_path = r"E:\credit card\user_card.csv"
+process_user_card(user_card, output_path)
